@@ -12,6 +12,8 @@ export type Screen =
       mode: "unlock" | "create";
       busy: boolean;
       error: string | null;
+      syncAvailable: boolean;
+      toast: string | null;
     }
   | {
       kind: "list";
@@ -22,7 +24,6 @@ export type Screen =
       editing: Entry | "new" | null;
       toast: string | null;
       syncAvailable: boolean;
-      syncModal: { error: string | null; busy: boolean } | null;
     };
 
 export interface Actions {
@@ -40,10 +41,8 @@ export interface Actions {
   saveEntry(e: Entry): void;
   deleteEntry(id: string): void;
   generatePassword(): string;
+  restore(masterPassword: string): void;
   runSync(): void;
-  closeSync(): void;
-  syncSignIn(email: string, password: string): void;
-  syncSignUp(email: string, password: string): void;
 }
 
 const esc = (s: string) =>
@@ -55,7 +54,6 @@ export function render(root: HTMLElement, s: Screen, a: Actions): void {
   if (s.kind === "locked") return renderLock(root, s, a);
   renderList(root, s, a);
   if (s.editing) renderModal(root, s.editing, a);
-  if (s.syncModal) renderSyncModal(root, s.syncModal, a);
 }
 
 // --- password strength (used by edit modal) ---------------------------------
@@ -97,10 +95,14 @@ function renderLock(
       <div class="status ${s.error ? "error" : ""}">
         ${s.busy ? "deriving key… ▓▓▓░░" : s.error ? esc(s.error) : create ? "First run — choose a master password" : ""}
       </div>
+      ${create && s.syncAvailable ? `<button type="button" id="restore" ${s.busy ? "disabled" : ""} title="type your master password above, then click">⇅ Restore from sync</button>` : ""}
+      ${s.toast ? `<div class="toast">${esc(s.toast)}</div>` : ""}
     </div>`;
   const form = root.querySelector<HTMLFormElement>("#lock-form")!;
   const pw = root.querySelector<HTMLInputElement>("#pw")!;
   pw.focus();
+  const restoreBtn = root.querySelector<HTMLButtonElement>("#restore");
+  if (restoreBtn) restoreBtn.onclick = () => a.restore(pw.value);
   form.onsubmit = (ev) => {
     ev.preventDefault();
     const pw2 = root.querySelector<HTMLInputElement>("#pw2");
@@ -310,54 +312,3 @@ function renderModal(root: HTMLElement, editing: Entry | "new", a: Actions): voi
   };
 }
 
-// --- 4. sync sign-in modal --------------------------------------------------------
-
-function renderSyncModal(
-  root: HTMLElement,
-  s: { error: string | null; busy: boolean },
-  a: Actions,
-): void {
-  const overlay = document.createElement("div");
-  overlay.className = "overlay";
-  overlay.innerHTML = `
-    <div class="modal">
-      <h2 style="margin:0;font-size:1.1rem">⇅ Sync — sign in</h2>
-      <p style="margin:0;font-size:0.85rem;color:var(--muted)">
-        Supabase account for syncing the encrypted blob — <b>not</b> your master
-        password. The server can never read your vault.
-      </p>
-      <label>Email <input id="s-email" type="email" autocomplete="off" ${s.busy ? "disabled" : ""} /></label>
-      <label>Account password <input id="s-pass" type="password" autocomplete="off" ${s.busy ? "disabled" : ""} /></label>
-      <div class="status error">${s.error ? esc(s.error) : ""}</div>
-      <div class="actions">
-        <span><button type="button" id="s-signup" ${s.busy ? "disabled" : ""}>Create account</button></span>
-        <span class="right">
-          <button type="button" id="s-cancel">Cancel</button>
-          <button type="button" id="s-signin" class="primary" ${s.busy ? "disabled" : ""}>${s.busy ? "…" : "Sign in"}</button>
-        </span>
-      </div>
-    </div>`;
-  root.appendChild(overlay);
-
-  const email = overlay.querySelector<HTMLInputElement>("#s-email")!;
-  const pass = overlay.querySelector<HTMLInputElement>("#s-pass")!;
-  email.focus();
-
-  overlay.querySelector<HTMLButtonElement>("#s-signin")!.onclick = () =>
-    a.syncSignIn(email.value.trim(), pass.value);
-  overlay.querySelector<HTMLButtonElement>("#s-signup")!.onclick = () =>
-    a.syncSignUp(email.value.trim(), pass.value);
-  overlay.querySelector<HTMLButtonElement>("#s-cancel")!.onclick = () => a.closeSync();
-  overlay.onkeydown = (ev) => {
-    if (ev.key === "Escape") {
-      ev.stopPropagation();
-      a.closeSync();
-    } else if (ev.key === "Enter") {
-      ev.preventDefault();
-      a.syncSignIn(email.value.trim(), pass.value);
-    }
-  };
-  overlay.onclick = (ev) => {
-    if (ev.target === overlay) a.closeSync();
-  };
-}

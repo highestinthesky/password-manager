@@ -1,23 +1,56 @@
 /**
  * sync.ts — Layer 4: Supabase encrypted-blob sync, last-write-wins.
  *
- * The server only ever sees the opaque VaultFile (ciphertext + public KDF
- * params). Plain fetch against Supabase's REST APIs — no SDK needed.
- * Sync is a bolt-on: if env vars are missing or the DB is paused, the app
- * works fine from local storage.
+ * Single credential design (Bitwarden-style): the Supabase account password is
+ * DERIVED from the master password via PBKDF2 with a different salt domain.
+ * The server only ever sees that derived value (then bcrypts it) — it can never
+ * recover the master password or the vault key. The email is just an identifier.
  *
- * Setup: supabase/setup.sql + .env.example
+ * Sync is a bolt-on: if env vars are missing or the DB is paused, the app
+ * works fine from local storage. Setup: supabase/setup.sql + .env.example
  */
 
 import type { VaultFile } from "./vault";
 
 const URL: string | undefined = import.meta.env.VITE_SUPABASE_URL;
 const ANON: string | undefined = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const EMAIL: string | undefined = import.meta.env.VITE_SYNC_EMAIL;
 
-/** True when the build was configured with a Supabase project. */
-export const syncEnabled: boolean = Boolean(URL && ANON);
+/** True when the build was configured with a Supabase project + sync email. */
+export const syncEnabled: boolean = Boolean(URL && ANON && EMAIL);
 
-// --- session (Supabase Auth, stored locally) --------------------------------
+// --- auth password derivation -------------------------------------------------
+
+/**
+ * Master password → Supabase account password. Deterministic (same on every
+ * device), domain-separated from the vault key (fixed email-based salt vs. the
+ * vault's random salt), and one-way (600k PBKDF2).
+ */
+async function deriveAuthPassword(masterPassword: string): Promise<string> {
+  const enc = new TextEncoder();
+  const material = await crypto.subtle.importKey(
+    "raw",
+    enc.encode(masterPassword),
+    "PBKDF2",
+    false,
+    ["deriveBits"],
+  );
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      hash: "SHA-256",
+      salt: enc.encode(`pm-sync-auth:${EMAIL!.toLowerCase()}`),
+      iterations: 600_000,
+    },
+    material,
+    256,
+  );
+  let bin = "";
+  for (const b of new Uint8Array(bits)) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
+// --- session (stored locally) ----------------------------------------------------
 
 interface Session {
   access_token: string;
@@ -77,15 +110,31 @@ function storeSession(d: AuthResponse): void {
   localStorage.setItem(SESSION_KEY, JSON.stringify(s));
 }
 
-/** Sign in with the Supabase account (NOT the master password). */
-export async function signIn(email: string, password: string): Promise<void> {
-  storeSession(await authPost("/auth/v1/token?grant_type=password", { email, password }));
-}
-
-export async function signUp(email: string, password: string): Promise<void> {
-  const d = await authPost("/auth/v1/signup", { email, password });
-  if (d.access_token) storeSession(d);
-  else throw new Error("Account created — confirm via the email link, then sign in.");
+/**
+ * Sign in using credentials derived from the master password.
+ * First ever run auto-creates the account (requires "Confirm email" OFF in
+ * Supabase → Authentication, since nobody knows the derived password to type).
+ */
+export async function ensureSignedIn(masterPassword: string): Promise<void> {
+  if (!syncEnabled) throw new Error("sync not configured");
+  if (getSession()) return;
+  const authPw = await deriveAuthPassword(masterPassword);
+  try {
+    storeSession(
+      await authPost("/auth/v1/token?grant_type=password", {
+        email: EMAIL,
+        password: authPw,
+      }),
+    );
+  } catch {
+    // no account yet (or wrong password) — try creating it
+    const d = await authPost("/auth/v1/signup", { email: EMAIL, password: authPw });
+    if (!d.access_token)
+      throw new Error(
+        "account needs email confirmation — disable 'Confirm email' in Supabase Auth settings",
+      );
+    storeSession(d);
+  }
 }
 
 async function freshToken(): Promise<Session> {
@@ -102,7 +151,7 @@ async function freshToken(): Promise<Session> {
   return s;
 }
 
-// --- blob push/pull ----------------------------------------------------------
+// --- blob push/pull -----------------------------------------------------------------
 
 async function rest(path: string, init: RequestInit = {}): Promise<Response> {
   const s = await freshToken();

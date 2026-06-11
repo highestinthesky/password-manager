@@ -30,6 +30,7 @@ const root = document.getElementById("app")!;
 // --- unlocked-state memory (dropped on lock) ----------------------------------
 let key: CryptoKey | null = null;
 let salt: Uint8Array | null = null;
+let masterPw: string | null = null; // kept while unlocked so pulled vaults (different salt) can be re-derived
 let entries: Entry[] = [];
 
 // --- persisted vault file (ciphertext — safe to keep around) -------------------
@@ -44,7 +45,6 @@ let revealedId: string | null = null;
 let editing: Entry | "new" | null = null;
 let toast: string | null = null;
 let toastTimer: number | undefined;
-let syncModal: { error: string | null; busy: boolean } | null = null;
 
 function filtered(): Entry[] {
   const q = query.trim().toLowerCase();
@@ -64,6 +64,8 @@ function screen(): Screen {
       mode: cachedVault ? "unlock" : "create",
       busy: lockBusy,
       error: lockError,
+      syncAvailable: sync.syncEnabled,
+      toast,
     };
   const list = filtered();
   selected = Math.min(selected, Math.max(0, list.length - 1));
@@ -76,7 +78,6 @@ function screen(): Screen {
     editing,
     toast,
     syncAvailable: sync.syncEnabled,
-    syncModal,
   };
 }
 
@@ -96,6 +97,7 @@ async function persist(): Promise<void> {
 function lock(): void {
   key = null;
   salt = null;
+  masterPw = null;
   entries = [];
   query = "";
   selected = 0;
@@ -103,7 +105,6 @@ function lock(): void {
   editing = null;
   toast = null;
   lockError = null;
-  syncModal = null;
   stopIdleTimer();
   stopSyncTimer();
   paint();
@@ -121,9 +122,10 @@ async function unlock(password: string): Promise<void> {
     entries = await decryptVault(cachedVault, k); // throws on wrong password (GCM auth)
     key = k;
     salt = fromBase64(cachedVault.kdf.salt);
+    masterPw = password;
     startIdleTimer();
     startSyncTimer();
-    if (sync.signedIn()) void runSync(false);
+    if (sync.syncEnabled) void runSync(false);
   } catch {
     lockError = "Wrong password";
   } finally {
@@ -152,11 +154,13 @@ async function createVault(password: string, confirm: string): Promise<void> {
   const k = await deriveKey(password, s, KDF_ITERATIONS);
   key = k;
   salt = s;
+  masterPw = password;
   entries = [];
   await persist();
   lockBusy = false;
   startIdleTimer();
   startSyncTimer();
+  if (sync.syncEnabled) void runSync(false);
   paint();
 }
 
@@ -174,6 +178,47 @@ function schedulePush(): void {
 
 let syncTimer: number | undefined;
 
+/**
+ * First-run on a new device: type the master password, click restore.
+ * Derives the sync credential, pulls the vault, decrypts, and unlocks —
+ * all from the one password.
+ */
+async function restoreFromSync(password: string): Promise<void> {
+  if (lockBusy) return;
+  if (!password) {
+    lockError = "Type your master password first, then click restore";
+    paint();
+    return;
+  }
+  lockBusy = true;
+  lockError = null;
+  paint();
+  await new Promise((r) => setTimeout(r, 30));
+  try {
+    await sync.ensureSignedIn(password);
+    const remote = await sync.pullVault();
+    if (!remote) {
+      lockError = "Nothing in sync yet — create a vault on your main device first";
+      return;
+    }
+    const k = await keyForVault(remote, password);
+    entries = await decryptVault(remote, k); // throws if master password differs
+    key = k;
+    salt = fromBase64(remote.kdf.salt);
+    masterPw = password;
+    cachedVault = remote;
+    await saveVault(remote);
+    startIdleTimer();
+    startSyncTimer();
+    showToast("✓ vault restored from sync");
+  } catch (e) {
+    lockError = e instanceof Error ? e.message : "restore failed";
+  } finally {
+    lockBusy = false;
+    paint();
+  }
+}
+
 /** Background auto-sync: every 60s while unlocked + whenever the window regains focus. */
 function startSyncTimer(): void {
   if (!sync.syncEnabled) return;
@@ -185,25 +230,22 @@ function stopSyncTimer(): void {
 }
 function autoSync(): Promise<void> | void {
   // skip mid-edit so a pull never swaps entries under an open modal
-  if (key && !editing && !syncModal && sync.signedIn()) return runSync(false);
+  if (key && !editing && sync.syncEnabled) return runSync(false);
 }
 window.addEventListener("focus", () => void autoSync());
 
 async function runSync(interactive = true): Promise<void> {
-  if (!sync.syncEnabled || !key) return;
-  if (!sync.signedIn()) {
-    if (interactive) {
-      syncModal = { error: null, busy: false };
-      paint();
-    }
-    return;
-  }
+  if (!sync.syncEnabled || !key || !masterPw) return;
   try {
+    await sync.ensureSignedIn(masterPw); // no-op when already signed in
     const { vault, action } = await sync.syncVault(cachedVault);
     if (action === "pulled" && vault) {
       try {
-        const pulled = await decryptVault(vault, key);
-        entries = pulled;
+        // re-derive with the REMOTE vault's salt — each device's vault has its own
+        const k2 = await keyForVault(vault, masterPw!);
+        entries = await decryptVault(vault, k2);
+        key = k2;
+        salt = fromBase64(vault.kdf.salt);
         cachedVault = vault;
         await saveVault(vault);
         showToast("✓ pulled latest from sync");
@@ -332,43 +374,8 @@ const actions: Actions = {
     paint();
   },
   generatePassword,
+  restore: (masterPassword) => void restoreFromSync(masterPassword),
   runSync: () => void runSync(true),
-  closeSync() {
-    syncModal = null;
-    paint();
-  },
-  syncSignIn(email, password) {
-    if (!email || !password || !syncModal) return;
-    syncModal = { error: null, busy: true };
-    paint();
-    sync
-      .signIn(email, password)
-      .then(() => {
-        syncModal = null;
-        paint();
-        return runSync(true);
-      })
-      .catch((e: unknown) => {
-        syncModal = { error: e instanceof Error ? e.message : "sign-in failed", busy: false };
-        paint();
-      });
-  },
-  syncSignUp(email, password) {
-    if (!email || !password || !syncModal) return;
-    syncModal = { error: null, busy: true };
-    paint();
-    sync
-      .signUp(email, password)
-      .then(() => {
-        syncModal = null;
-        paint();
-        return runSync(true);
-      })
-      .catch((e: unknown) => {
-        syncModal = { error: e instanceof Error ? e.message : "sign-up failed", busy: false };
-        paint();
-      });
-  },
 };
 
 // --- global keyboard (list screen) ------------------------------------------------------------------
@@ -380,7 +387,7 @@ window.addEventListener("keydown", (ev) => {
     lock();
     return;
   }
-  if (editing || syncModal) return; // modals handle their own keys
+  if (editing) return; // modal handles its own keys
   const list = filtered();
   const cur = list[selected];
   if (ev.key === "ArrowDown") {
