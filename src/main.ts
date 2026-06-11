@@ -23,6 +23,7 @@ const AUTO_LOCK_MS = 5 * 60_000; // 5 min idle (hardcoded in v1)
 const HIDDEN_GRACE_MS = 30_000; // lock 30s after tab hidden
 const CLIPBOARD_CLEAR_MS = 30_000;
 const PUSH_DEBOUNCE_MS = 1_500;
+const SYNC_PULL_MS = 60_000; // background pull while unlocked
 
 const root = document.getElementById("app")!;
 
@@ -104,6 +105,7 @@ function lock(): void {
   lockError = null;
   syncModal = null;
   stopIdleTimer();
+  stopSyncTimer();
   paint();
 }
 
@@ -120,6 +122,7 @@ async function unlock(password: string): Promise<void> {
     key = k;
     salt = fromBase64(cachedVault.kdf.salt);
     startIdleTimer();
+    startSyncTimer();
     if (sync.signedIn()) void runSync(false);
   } catch {
     lockError = "Wrong password";
@@ -153,6 +156,7 @@ async function createVault(password: string, confirm: string): Promise<void> {
   await persist();
   lockBusy = false;
   startIdleTimer();
+  startSyncTimer();
   paint();
 }
 
@@ -167,6 +171,23 @@ function schedulePush(): void {
       sync.pushVault(cachedVault).catch(() => showToast("⚠ sync push failed — will retry on next save"));
   }, PUSH_DEBOUNCE_MS);
 }
+
+let syncTimer: number | undefined;
+
+/** Background auto-sync: every 60s while unlocked + whenever the window regains focus. */
+function startSyncTimer(): void {
+  if (!sync.syncEnabled) return;
+  clearInterval(syncTimer);
+  syncTimer = window.setInterval(() => void autoSync(), SYNC_PULL_MS);
+}
+function stopSyncTimer(): void {
+  clearInterval(syncTimer);
+}
+function autoSync(): Promise<void> | void {
+  // skip mid-edit so a pull never swaps entries under an open modal
+  if (key && !editing && !syncModal && sync.signedIn()) return runSync(false);
+}
+window.addEventListener("focus", () => void autoSync());
 
 async function runSync(interactive = true): Promise<void> {
   if (!sync.syncEnabled || !key) return;
@@ -189,16 +210,16 @@ async function runSync(interactive = true): Promise<void> {
       } catch {
         showToast("⚠ remote vault uses a different master password — kept local copy");
       }
-    } else if (action === "pushed") {
+    } else if (action === "pushed" && interactive) {
       showToast("✓ pushed to sync");
     } else if (interactive) {
       showToast("✓ in sync");
     }
   } catch (e) {
+    // background failures stay quiet — local-first, it'll retry in 60s
     if (interactive)
       showToast(`⚠ sync failed: ${e instanceof Error ? e.message : "offline?"}`);
   }
-  paint();
 }
 
 // --- auto-lock --------------------------------------------------------------------------
