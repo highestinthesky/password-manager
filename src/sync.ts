@@ -14,10 +14,28 @@ import type { VaultFile } from "./vault";
 
 const URL: string | undefined = import.meta.env.VITE_SUPABASE_URL;
 const ANON: string | undefined = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const EMAIL: string | undefined = import.meta.env.VITE_SYNC_EMAIL;
 
-/** True when the build was configured with a Supabase project + sync email. */
-export const syncEnabled: boolean = Boolean(URL && ANON && EMAIL);
+const EMAIL_KEY = "pm.sync.email";
+
+/** Account identifier. Locally-set value overrides the build-time default. */
+export function getSyncEmail(): string | null {
+  return (
+    localStorage.getItem(EMAIL_KEY) ??
+    (import.meta.env.VITE_SYNC_EMAIL as string | undefined) ??
+    null
+  );
+}
+
+/** Changing the email switches accounts, so the old session is dropped. */
+export function setSyncEmail(email: string): void {
+  localStorage.setItem(EMAIL_KEY, email.trim().toLowerCase());
+  signOut();
+}
+
+/** True when configured with a Supabase project + sync email. */
+export function syncEnabled(): boolean {
+  return Boolean(URL && ANON && getSyncEmail());
+}
 
 // --- auth password derivation -------------------------------------------------
 
@@ -39,7 +57,7 @@ async function deriveAuthPassword(masterPassword: string): Promise<string> {
     {
       name: "PBKDF2",
       hash: "SHA-256",
-      salt: enc.encode(`pm-sync-auth:${EMAIL!.toLowerCase()}`),
+      salt: enc.encode(`pm-sync-auth:${getSyncEmail()!.toLowerCase()}`),
       iterations: 600_000,
     },
     material,
@@ -72,7 +90,7 @@ function getSession(): Session | null {
 }
 
 export function signedIn(): boolean {
-  return syncEnabled && getSession() !== null;
+  return syncEnabled() && getSession() !== null;
 }
 
 export function signOut(): void {
@@ -116,19 +134,20 @@ function storeSession(d: AuthResponse): void {
  * Supabase → Authentication, since nobody knows the derived password to type).
  */
 export async function ensureSignedIn(masterPassword: string): Promise<void> {
-  if (!syncEnabled) throw new Error("sync not configured");
+  if (!syncEnabled()) throw new Error("sync not configured");
   if (getSession()) return;
+  const email = getSyncEmail()!;
   const authPw = await deriveAuthPassword(masterPassword);
   try {
     storeSession(
       await authPost("/auth/v1/token?grant_type=password", {
-        email: EMAIL,
+        email,
         password: authPw,
       }),
     );
   } catch {
     // no account yet (or wrong password) — try creating it
-    const d = await authPost("/auth/v1/signup", { email: EMAIL, password: authPw });
+    const d = await authPost("/auth/v1/signup", { email, password: authPw });
     if (!d.access_token)
       throw new Error(
         "account needs email confirmation — disable 'Confirm email' in Supabase Auth settings",

@@ -24,6 +24,8 @@ export type Screen =
       editing: Entry | "new" | null;
       toast: string | null;
       syncAvailable: boolean;
+      syncEmail: string | null;
+      settings: boolean;
     };
 
 export interface Actions {
@@ -43,6 +45,9 @@ export interface Actions {
   generatePassword(): string;
   restore(masterPassword: string): void;
   runSync(): void;
+  openSettings(): void;
+  closeSettings(): void;
+  saveSyncEmail(email: string): void;
 }
 
 const esc = (s: string) =>
@@ -54,6 +59,7 @@ export function render(root: HTMLElement, s: Screen, a: Actions): void {
   if (s.kind === "locked") return renderLock(root, s, a);
   renderList(root, s, a);
   if (s.editing) renderModal(root, s.editing, a);
+  if (s.settings) renderSettings(root, s.syncEmail, a);
 }
 
 // --- password strength (used by edit modal) ---------------------------------
@@ -137,6 +143,7 @@ function renderList(
       <input id="search" type="search" placeholder="🔍 search…" autocomplete="off" value="${esc(s.query)}" />
       <button id="new">+ New</button>
       ${s.syncAvailable ? '<button id="sync" title="sync now">⇅</button>' : ""}
+      <button id="settings" title="settings">⚙</button>
       <button id="lock" title="lock (⌘L)">🔒</button>
     </div>
     <div class="rows">${rows || `<div class="empty">${s.query ? "No matches" : "Empty vault — add your first entry"}</div>`}</div>
@@ -154,6 +161,7 @@ function renderList(
   root.querySelector<HTMLButtonElement>("#lock")!.onclick = () => a.lock();
   const syncBtn = root.querySelector<HTMLButtonElement>("#sync");
   if (syncBtn) syncBtn.onclick = () => a.runSync();
+  root.querySelector<HTMLButtonElement>("#settings")!.onclick = () => a.openSettings();
 
   root.querySelectorAll<HTMLButtonElement>(".copy").forEach((b) => {
     b.onclick = (ev) => {
@@ -292,11 +300,19 @@ function renderModal(root: HTMLElement, editing: Entry | "new", a: Actions): voi
   };
   $("#m-save").onclick = save;
   $("#m-cancel").onclick = () => a.closeEdit();
+  // two-click confirm — native confirm() dialogs don't work in Tauri's webview
   const del = overlay.querySelector<HTMLButtonElement>("#m-del");
-  if (del)
+  if (del) {
+    let armed = false;
     del.onclick = () => {
-      if (confirm(`Delete "${e.title}"? This cannot be undone.`)) a.deleteEntry(e.id);
+      if (!armed) {
+        armed = true;
+        del.textContent = "Really delete?";
+        return;
+      }
+      a.deleteEntry(e.id);
     };
+  }
 
   overlay.onkeydown = (ev) => {
     if (ev.key === "Escape") {
@@ -309,6 +325,59 @@ function renderModal(root: HTMLElement, editing: Entry | "new", a: Actions): voi
   };
   overlay.onclick = (ev) => {
     if (ev.target === overlay) a.closeEdit();
+  };
+}
+
+// --- 4. settings modal -------------------------------------------------------------
+
+function renderSettings(root: HTMLElement, syncEmail: string | null, a: Actions): void {
+  const overlay = document.createElement("div");
+  overlay.className = "overlay";
+  overlay.innerHTML = `
+    <div class="modal">
+      <h2 style="margin:0;font-size:1.1rem">⚙ Settings</h2>
+      <label>Sync email
+        <input id="set-email" type="email" value="${esc(syncEmail ?? "")}" autocomplete="off" placeholder="you@example.com" />
+      </label>
+      <p style="margin:0;font-size:0.8rem;color:var(--muted)">
+        Identifier for your sync account. Changing it switches to a (possibly new)
+        account — your local vault is then pushed there on the next sync.
+        The account password is derived from your master password automatically.
+      </p>
+      <div class="actions">
+        <span></span>
+        <span class="right">
+          <button type="button" id="set-cancel">Cancel</button>
+          <button type="button" id="set-save" class="primary">Save</button>
+        </span>
+      </div>
+    </div>`;
+  root.appendChild(overlay);
+
+  const email = overlay.querySelector<HTMLInputElement>("#set-email")!;
+  email.focus();
+
+  const save = () => {
+    const v = email.value.trim();
+    if (!v || !v.includes("@")) {
+      email.focus();
+      return;
+    }
+    a.saveSyncEmail(v);
+  };
+  overlay.querySelector<HTMLButtonElement>("#set-save")!.onclick = save;
+  overlay.querySelector<HTMLButtonElement>("#set-cancel")!.onclick = () => a.closeSettings();
+  overlay.onkeydown = (ev) => {
+    if (ev.key === "Escape") {
+      ev.stopPropagation();
+      a.closeSettings();
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      save();
+    }
+  };
+  overlay.onclick = (ev) => {
+    if (ev.target === overlay) a.closeSettings();
   };
 }
 

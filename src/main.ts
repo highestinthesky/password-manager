@@ -45,6 +45,7 @@ let revealedId: string | null = null;
 let editing: Entry | "new" | null = null;
 let toast: string | null = null;
 let toastTimer: number | undefined;
+let settingsOpen = false;
 
 function filtered(): Entry[] {
   const q = query.trim().toLowerCase();
@@ -64,7 +65,7 @@ function screen(): Screen {
       mode: cachedVault ? "unlock" : "create",
       busy: lockBusy,
       error: lockError,
-      syncAvailable: sync.syncEnabled,
+      syncAvailable: sync.syncEnabled(),
       toast,
     };
   const list = filtered();
@@ -77,7 +78,9 @@ function screen(): Screen {
     revealedId,
     editing,
     toast,
-    syncAvailable: sync.syncEnabled,
+    syncAvailable: sync.syncEnabled(),
+    syncEmail: sync.getSyncEmail(),
+    settings: settingsOpen,
   };
 }
 
@@ -105,6 +108,7 @@ function lock(): void {
   editing = null;
   toast = null;
   lockError = null;
+  settingsOpen = false;
   stopIdleTimer();
   stopSyncTimer();
   paint();
@@ -125,7 +129,7 @@ async function unlock(password: string): Promise<void> {
     masterPw = password;
     startIdleTimer();
     startSyncTimer();
-    if (sync.syncEnabled) void runSync(false);
+    if (sync.syncEnabled()) void runSync(false);
   } catch {
     lockError = "Wrong password";
   } finally {
@@ -160,7 +164,7 @@ async function createVault(password: string, confirm: string): Promise<void> {
   lockBusy = false;
   startIdleTimer();
   startSyncTimer();
-  if (sync.syncEnabled) void runSync(false);
+  if (sync.syncEnabled()) void runSync(false);
   paint();
 }
 
@@ -168,7 +172,7 @@ async function createVault(password: string, confirm: string): Promise<void> {
 let pushTimer: number | undefined;
 
 function schedulePush(): void {
-  if (!sync.syncEnabled) return;
+  if (!sync.syncEnabled()) return;
   clearTimeout(pushTimer);
   // route through runSync so stale-session recovery applies to pushes too
   pushTimer = window.setTimeout(() => void runSync(false), PUSH_DEBOUNCE_MS);
@@ -226,7 +230,7 @@ async function restoreFromSync(password: string): Promise<void> {
 
 /** Background auto-sync: every 60s while unlocked + whenever the window regains focus. */
 function startSyncTimer(): void {
-  if (!sync.syncEnabled) return;
+  if (!sync.syncEnabled()) return;
   clearInterval(syncTimer);
   syncTimer = window.setInterval(() => void autoSync(), SYNC_PULL_MS);
 }
@@ -235,12 +239,12 @@ function stopSyncTimer(): void {
 }
 function autoSync(): Promise<void> | void {
   // skip mid-edit so a pull never swaps entries under an open modal
-  if (key && !editing && sync.syncEnabled) return runSync(false);
+  if (key && !editing && !settingsOpen && sync.syncEnabled()) return runSync(false);
 }
 window.addEventListener("focus", () => void autoSync());
 
 async function runSync(interactive = true): Promise<void> {
-  if (!sync.syncEnabled || !key || !masterPw) return;
+  if (!sync.syncEnabled() || !key || !masterPw) return;
   try {
     let result;
     try {
@@ -390,6 +394,21 @@ const actions: Actions = {
   generatePassword,
   restore: (masterPassword) => void restoreFromSync(masterPassword),
   runSync: () => void runSync(true),
+  openSettings() {
+    settingsOpen = true;
+    paint();
+  },
+  closeSettings() {
+    settingsOpen = false;
+    paint();
+  },
+  saveSyncEmail(email) {
+    sync.setSyncEmail(email); // drops the old session — different account
+    settingsOpen = false;
+    showToast(`✓ sync account: ${email}`);
+    startSyncTimer();
+    void runSync(false); // sign in / auto-create under the new email, then reconcile
+  },
 };
 
 // --- global keyboard (list screen) ------------------------------------------------------------------
@@ -401,7 +420,7 @@ window.addEventListener("keydown", (ev) => {
     lock();
     return;
   }
-  if (editing) return; // modal handles its own keys
+  if (editing || settingsOpen) return; // modals handle their own keys
   const list = filtered();
   const cur = list[selected];
   if (ev.key === "ArrowDown") {
