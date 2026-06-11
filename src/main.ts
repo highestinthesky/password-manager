@@ -168,12 +168,10 @@ async function createVault(password: string, confirm: string): Promise<void> {
 let pushTimer: number | undefined;
 
 function schedulePush(): void {
-  if (!sync.signedIn()) return;
+  if (!sync.syncEnabled) return;
   clearTimeout(pushTimer);
-  pushTimer = window.setTimeout(() => {
-    if (cachedVault)
-      sync.pushVault(cachedVault).catch(() => showToast("⚠ sync push failed — will retry on next save"));
-  }, PUSH_DEBOUNCE_MS);
+  // route through runSync so stale-session recovery applies to pushes too
+  pushTimer = window.setTimeout(() => void runSync(false), PUSH_DEBOUNCE_MS);
 }
 
 let syncTimer: number | undefined;
@@ -195,8 +193,15 @@ async function restoreFromSync(password: string): Promise<void> {
   paint();
   await new Promise((r) => setTimeout(r, 30));
   try {
-    await sync.ensureSignedIn(password);
-    const remote = await sync.pullVault();
+    let remote;
+    try {
+      await sync.ensureSignedIn(password);
+      remote = await sync.pullVault();
+    } catch {
+      sync.signOut();
+      await sync.ensureSignedIn(password);
+      remote = await sync.pullVault();
+    }
     if (!remote) {
       lockError = "Nothing in sync yet — create a vault on your main device first";
       return;
@@ -237,8 +242,17 @@ window.addEventListener("focus", () => void autoSync());
 async function runSync(interactive = true): Promise<void> {
   if (!sync.syncEnabled || !key || !masterPw) return;
   try {
-    await sync.ensureSignedIn(masterPw); // no-op when already signed in
-    const { vault, action } = await sync.syncVault(cachedVault);
+    let result;
+    try {
+      await sync.ensureSignedIn(masterPw); // no-op when already signed in
+      result = await sync.syncVault(cachedVault);
+    } catch {
+      // stale session (e.g. account deleted/recreated) — sign out, re-auth, retry once
+      sync.signOut();
+      await sync.ensureSignedIn(masterPw);
+      result = await sync.syncVault(cachedVault);
+    }
+    const { vault, action } = result;
     if (action === "pulled" && vault) {
       try {
         // re-derive with the REMOTE vault's salt — each device's vault has its own
