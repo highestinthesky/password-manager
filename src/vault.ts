@@ -15,14 +15,16 @@ export interface Entry {
   password: string;
   keywords: string[];
   notes?: string;
+  updatedAt: number; // ms epoch — per-entry, drives entry-level merge
+  deleted?: boolean; // tombstone: kept (secret stripped) so deletes propagate
 }
 
 export interface VaultFile {
-  version: 1;
+  version: 1 | 2; // 2 adds per-entry updatedAt + tombstones; 1 is read-compatible
   kdf: { algo: "PBKDF2-SHA256"; iterations: number; salt: string };
   cipher: { algo: "AES-256-GCM"; nonce: string };
   ciphertext: string;
-  updatedAt: number; // ms epoch — last-write-wins sync key
+  updatedAt: number; // ms epoch — vault-level write time
 }
 
 export const KDF_ITERATIONS = 600_000;
@@ -86,7 +88,7 @@ export async function encryptVault(
     plaintext as BufferSource,
   );
   return {
-    version: 1,
+    version: 2,
     kdf: { algo: "PBKDF2-SHA256", iterations, salt: toBase64(salt) },
     cipher: { algo: "AES-256-GCM", nonce: toBase64(nonce) },
     ciphertext: toBase64(new Uint8Array(ct)),
@@ -109,7 +111,13 @@ export async function decryptVault(
     key,
     ct as BufferSource,
   );
-  return JSON.parse(new TextDecoder().decode(pt)) as Entry[];
+  const raw = JSON.parse(new TextDecoder().decode(pt)) as Entry[];
+  // Migrate v1 entries (no per-entry updatedAt) — fall back to the vault's time.
+  return raw.map((e) => ({
+    ...e,
+    keywords: e.keywords ?? [],
+    updatedAt: typeof e.updatedAt === "number" ? e.updatedAt : vault.updatedAt,
+  }));
 }
 
 /** Convenience: derive key from password using the vault's own KDF params. */
@@ -122,4 +130,36 @@ export async function keyForVault(
 
 export function newEntryId(): string {
   return crypto.randomUUID();
+}
+
+// --- entry-level merge (for sync) --------------------------------------------
+
+/** Order-stable canonical string for an entry, so equality is reliable. */
+function canon(e: Entry): string {
+  return JSON.stringify([
+    e.id, e.title, e.username, e.password,
+    e.keywords, e.notes ?? "", e.updatedAt, e.deleted === true,
+  ]);
+}
+
+/**
+ * Merge two entry sets by id — newest write wins per entry, including deletes.
+ * Tombstones are preserved so a deletion on one device isn't resurrected by an
+ * older copy on another. Result is sorted by id for determinism.
+ */
+export function mergeEntries(a: Entry[], b: Entry[]): Entry[] {
+  const byId = new Map<string, Entry>();
+  for (const e of [...a, ...b]) {
+    const prev = byId.get(e.id);
+    if (!prev || e.updatedAt > prev.updatedAt) byId.set(e.id, e);
+  }
+  return [...byId.values()].sort((x, y) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0));
+}
+
+/** Order-independent logical equality of two entry sets. */
+export function entriesEqual(a: Entry[], b: Entry[]): boolean {
+  if (a.length !== b.length) return false;
+  const sa = a.map(canon).sort();
+  const sb = b.map(canon).sort();
+  return sa.every((v, i) => v === sb[i]);
 }

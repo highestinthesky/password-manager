@@ -10,20 +10,28 @@ import {
   decryptVault,
   keyForVault,
   newSalt,
+  newEntryId,
   fromBase64,
+  mergeEntries,
+  entriesEqual,
   KDF_ITERATIONS,
   type Entry,
   type VaultFile,
 } from "./vault";
 import { loadVault, saveVault } from "./storage";
+import { parseImport } from "./import";
+import { toMarkdown, exportFilename } from "./markdown";
+import { loadPrefs, savePrefs, type Prefs } from "./prefs";
 import * as sync from "./sync";
 import { render, type Screen, type Actions } from "./ui";
 
-const AUTO_LOCK_MS = 5 * 60_000; // 5 min idle (hardcoded in v1)
+const APP_VERSION = "0.3.0";
 const HIDDEN_GRACE_MS = 30_000; // lock 30s after tab hidden
-const CLIPBOARD_CLEAR_MS = 30_000;
 const PUSH_DEBOUNCE_MS = 1_500;
 const SYNC_PULL_MS = 60_000; // background pull while unlocked
+
+// auto-lock + clipboard-clear are now user preferences (prefs.ts)
+let prefs: Prefs = loadPrefs();
 
 const root = document.getElementById("app")!;
 
@@ -46,11 +54,18 @@ let editing: Entry | "new" | null = null;
 let toast: string | null = null;
 let toastTimer: number | undefined;
 let settingsOpen = false;
+let importOpen = false;
+
+/** Visible entries — tombstones (deleted, kept only for sync) are hidden. */
+function live(): Entry[] {
+  return entries.filter((e) => !e.deleted);
+}
 
 function filtered(): Entry[] {
+  const items = live();
   const q = query.trim().toLowerCase();
-  if (!q) return entries;
-  return entries.filter(
+  if (!q) return items;
+  return items.filter(
     (e) =>
       e.title.toLowerCase().includes(q) ||
       e.username.toLowerCase().includes(q) ||
@@ -81,6 +96,11 @@ function screen(): Screen {
     syncAvailable: sync.syncEnabled(),
     syncEmail: sync.getSyncEmail(),
     settings: settingsOpen,
+    importing: importOpen,
+    autoLockMs: prefs.autoLockMs,
+    clipboardClearMs: prefs.clipboardClearMs,
+    entryCount: live().length,
+    appVersion: APP_VERSION,
   };
 }
 
@@ -89,10 +109,16 @@ function paint(): void {
 }
 
 // --- persistence -------------------------------------------------------------------
-async function persist(): Promise<void> {
+/** Encrypt + write the vault locally (no sync push). */
+async function persistLocal(): Promise<void> {
   if (!key || !salt) return;
   cachedVault = await encryptVault(entries, key, salt);
   await saveVault(cachedVault);
+}
+
+/** Local save + schedule a debounced sync push. */
+async function persist(): Promise<void> {
+  await persistLocal();
   schedulePush();
 }
 
@@ -109,6 +135,7 @@ function lock(): void {
   toast = null;
   lockError = null;
   settingsOpen = false;
+  importOpen = false;
   stopIdleTimer();
   stopSyncTimer();
   paint();
@@ -197,15 +224,8 @@ async function restoreFromSync(password: string): Promise<void> {
   paint();
   await new Promise((r) => setTimeout(r, 30));
   try {
-    let remote;
-    try {
-      await sync.ensureSignedIn(password);
-      remote = await sync.pullVault();
-    } catch {
-      sync.signOut();
-      await sync.ensureSignedIn(password);
-      remote = await sync.pullVault();
-    }
+    await sync.ensureSignedIn(password);
+    const remote = await sync.pullVault();
     if (!remote) {
       lockError = "Nothing in sync yet — create a vault on your main device first";
       return;
@@ -219,6 +239,7 @@ async function restoreFromSync(password: string): Promise<void> {
     await saveVault(remote);
     startIdleTimer();
     startSyncTimer();
+    void runSync(false); // reconcile + start realtime
     showToast("✓ vault restored from sync");
   } catch (e) {
     lockError = e instanceof Error ? e.message : "restore failed";
@@ -228,7 +249,7 @@ async function restoreFromSync(password: string): Promise<void> {
   }
 }
 
-/** Background auto-sync: every 60s while unlocked + whenever the window regains focus. */
+/** Background auto-sync: every 60s while unlocked + on window focus + on realtime push. */
 function startSyncTimer(): void {
   if (!sync.syncEnabled()) return;
   clearInterval(syncTimer);
@@ -236,49 +257,82 @@ function startSyncTimer(): void {
 }
 function stopSyncTimer(): void {
   clearInterval(syncTimer);
+  stopRealtime();
 }
 function autoSync(): Promise<void> | void {
-  // skip mid-edit so a pull never swaps entries under an open modal
+  // skip mid-edit so a merge never swaps entries under an open modal
   if (key && !editing && !settingsOpen && sync.syncEnabled()) return runSync(false);
 }
 window.addEventListener("focus", () => void autoSync());
 
+// Realtime: subscribe once we're signed in; another device's push pings autoSync.
+let unsub: (() => void) | null = null;
+function ensureRealtime(): void {
+  if (unsub || !sync.syncEnabled()) return;
+  unsub = sync.subscribeVault(() => void autoSync());
+}
+function stopRealtime(): void {
+  unsub?.();
+  unsub = null;
+}
+
+let syncing = false;
+
+/**
+ * Pull the remote vault, merge entry-by-entry with the local one (newest write
+ * wins per entry, deletes propagate via tombstones), then push if the remote is
+ * missing anything. Idempotent — a no-op converges without a write, so the
+ * realtime echo of our own push can't loop.
+ */
 async function runSync(interactive = true): Promise<void> {
-  if (!sync.syncEnabled() || !key || !masterPw) return;
+  if (!sync.syncEnabled() || !key || !masterPw || syncing) return;
+  syncing = true;
   try {
-    let result;
+    await sync.ensureSignedIn(masterPw);
+    ensureRealtime();
+    const remote = await sync.pullVault();
+
+    if (!remote) {
+      if (!cachedVault) await persistLocal();
+      if (cachedVault) await sync.pushVault(cachedVault);
+      if (interactive) showToast("✓ pushed to sync");
+      return;
+    }
+
+    let remoteEntries: Entry[];
     try {
-      await sync.ensureSignedIn(masterPw); // no-op when already signed in
-      result = await sync.syncVault(cachedVault);
+      remoteEntries = await decryptVault(remote, await keyForVault(remote, masterPw));
     } catch {
-      // stale session (e.g. account deleted/recreated) — sign out, re-auth, retry once
-      sync.signOut();
-      await sync.ensureSignedIn(masterPw);
-      result = await sync.syncVault(cachedVault);
-    }
-    const { vault, action } = result;
-    if (action === "pulled" && vault) {
-      try {
-        // re-derive with the REMOTE vault's salt — each device's vault has its own
-        const k2 = await keyForVault(vault, masterPw!);
-        entries = await decryptVault(vault, k2);
-        key = k2;
-        salt = fromBase64(vault.kdf.salt);
-        cachedVault = vault;
-        await saveVault(vault);
-        showToast("✓ pulled latest from sync");
-      } catch {
+      if (interactive)
         showToast("⚠ remote vault uses a different master password — kept local copy");
-      }
-    } else if (action === "pushed" && interactive) {
-      showToast("✓ pushed to sync");
-    } else if (interactive) {
-      showToast("✓ in sync");
+      return;
     }
+
+    const merged = mergeEntries(entries, remoteEntries);
+    const localChanged = !entriesEqual(merged, entries);
+    const remoteChanged = !entriesEqual(merged, remoteEntries);
+
+    if (localChanged) {
+      entries = merged;
+      await persistLocal();
+      paint();
+    }
+    if (remoteChanged) {
+      if (!cachedVault || localChanged) await persistLocal();
+      await sync.pushVault(cachedVault!);
+    }
+    if (interactive)
+      showToast(
+        localChanged ? "✓ pulled latest from sync"
+        : remoteChanged ? "✓ pushed to sync"
+        : "✓ in sync",
+      );
   } catch (e) {
-    // background failures stay quiet — local-first, it'll retry in 60s
+    // background failures stay quiet — local-first, it retries on the next tick
     if (interactive)
       showToast(`⚠ sync failed: ${e instanceof Error ? e.message : "offline?"}`);
+  } finally {
+    syncing = false;
   }
 }
 
@@ -288,7 +342,7 @@ let hiddenTimer: number | undefined;
 
 function startIdleTimer(): void {
   clearTimeout(idleTimer);
-  idleTimer = window.setTimeout(lock, AUTO_LOCK_MS);
+  idleTimer = window.setTimeout(lock, prefs.autoLockMs);
 }
 function stopIdleTimer(): void {
   clearTimeout(idleTimer);
@@ -323,7 +377,7 @@ async function copyToClipboard(text: string, what: string): Promise<void> {
     } catch {
       /* clipboard read may be denied when unfocused — skip clearing */
     }
-  }, CLIPBOARD_CLEAR_MS);
+  }, prefs.clipboardClearMs);
 }
 
 function showToast(msg: string): void {
@@ -342,6 +396,95 @@ function generatePassword(len = 20): string {
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*-_=+?";
   const bytes = crypto.getRandomValues(new Uint32Array(len));
   return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join("");
+}
+
+// --- import -------------------------------------------------------------------------------------
+/**
+ * Merge pasted credentials into the vault. Skips rows that duplicate an
+ * existing title+username (case-insensitive) so re-pasting is safe.
+ */
+function importEntries(text: string): void {
+  if (!key) return;
+  const { entries: parsed } = parseImport(text);
+  if (parsed.length === 0) {
+    importOpen = false;
+    showToast("Nothing to import");
+    return;
+  }
+  const sig = (title: string, user: string) =>
+    `${title.toLowerCase()} ${user.toLowerCase()}`;
+  const seen = new Set(live().map((e) => sig(e.title, e.username)));
+  let added = 0;
+  let skipped = 0;
+  for (const p of parsed) {
+    const s = sig(p.title, p.username);
+    if (seen.has(s)) {
+      skipped++;
+      continue;
+    }
+    seen.add(s);
+    const entry: Entry = {
+      id: newEntryId(),
+      title: p.title,
+      username: p.username,
+      password: p.password,
+      keywords: p.keywords,
+      updatedAt: Date.now(),
+    };
+    if (p.notes) entry.notes = p.notes;
+    entries.push(entry);
+    added++;
+  }
+  importOpen = false;
+  if (added > 0) void persist();
+  showToast(
+    `✓ imported ${added}` +
+      (skipped ? `, skipped ${skipped} duplicate${skipped === 1 ? "" : "s"}` : ""),
+  );
+}
+
+// --- export -------------------------------------------------------------------------------------
+const isTauriEnv =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+/** Export the decrypted vault as a Markdown file. Plaintext — confirmed in the UI. */
+async function exportVault(): Promise<void> {
+  if (!key) return;
+  const md = toMarkdown(live());
+  const name = exportFilename();
+  try {
+    if (isTauriEnv) {
+      const { writeTextFile, mkdir, BaseDirectory } = await import("@tauri-apps/plugin-fs");
+      try {
+        await writeTextFile(name, md, { baseDir: BaseDirectory.Download });
+        showToast(`✓ exported to Downloads/${name}`);
+      } catch {
+        // Download scope not granted — fall back to the app data dir
+        try {
+          await mkdir("", { baseDir: BaseDirectory.AppData, recursive: true });
+        } catch {
+          /* already exists */
+        }
+        await writeTextFile(name, md, { baseDir: BaseDirectory.AppData });
+        showToast(`✓ exported ${name} (app data folder)`);
+      }
+    } else {
+      const blob = new Blob([md], { type: "text/markdown" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1_000);
+      showToast(`✓ exported ${name}`);
+    }
+  } catch (e) {
+    showToast(`⚠ export failed: ${e instanceof Error ? e.message : "unknown"}`);
+  }
+  settingsOpen = false;
+  paint();
 }
 
 // --- actions ------------------------------------------------------------------------------------
@@ -378,15 +521,24 @@ const actions: Actions = {
     paint();
   },
   saveEntry(e) {
-    const i = entries.findIndex((x) => x.id === e.id);
-    if (i >= 0) entries[i] = e;
-    else entries.push(e);
+    const stamped: Entry = { ...e, updatedAt: Date.now(), deleted: false };
+    const i = entries.findIndex((x) => x.id === stamped.id);
+    if (i >= 0) entries[i] = stamped;
+    else entries.push(stamped);
     editing = null;
     void persist();
     paint();
   },
   deleteEntry(id) {
-    entries = entries.filter((x) => x.id !== id);
+    // tombstone, not removal — strip the secret but keep the id so the delete
+    // propagates through sync and isn't resurrected by another device's copy
+    const i = entries.findIndex((x) => x.id === id);
+    if (i >= 0) {
+      entries[i] = {
+        id, title: "", username: "", password: "", keywords: [],
+        updatedAt: Date.now(), deleted: true,
+      };
+    }
     editing = null;
     void persist();
     paint();
@@ -409,6 +561,25 @@ const actions: Actions = {
     startSyncTimer();
     void runSync(false); // sign in / auto-create under the new email, then reconcile
   },
+  openImport() {
+    importOpen = true;
+    paint();
+  },
+  closeImport() {
+    importOpen = false;
+    paint();
+  },
+  importEntries,
+  setAutoLock(ms) {
+    prefs = { ...prefs, autoLockMs: ms };
+    savePrefs(prefs);
+    if (key) startIdleTimer(); // re-arm with the new timeout
+  },
+  setClipboardClear(ms) {
+    prefs = { ...prefs, clipboardClearMs: ms };
+    savePrefs(prefs);
+  },
+  exportMarkdown: () => void exportVault(),
 };
 
 // --- global keyboard (list screen) ------------------------------------------------------------------
@@ -420,7 +591,12 @@ window.addEventListener("keydown", (ev) => {
     lock();
     return;
   }
-  if (editing || settingsOpen) return; // modals handle their own keys
+  if (mod && ev.key.toLowerCase() === "i" && !editing && !settingsOpen && !importOpen) {
+    ev.preventDefault();
+    actions.openImport();
+    return;
+  }
+  if (editing || settingsOpen || importOpen) return; // modals handle their own keys
   const list = filtered();
   const cur = list[selected];
   if (ev.key === "ArrowDown") {

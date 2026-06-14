@@ -3,6 +3,7 @@ dist/
 *.local
 .env
 .DS_Store
+vite.config.ts.timestamp-*
 
 # never commit a vault
 *.vault.json

@@ -5,6 +5,9 @@
  */
 
 import type { Entry } from "./vault";
+import { parseImport } from "./import";
+import { suggestKeywords } from "./keywords";
+import { AUTO_LOCK_OPTIONS, CLIPBOARD_OPTIONS } from "./prefs";
 
 export type Screen =
   | {
@@ -26,6 +29,11 @@ export type Screen =
       syncAvailable: boolean;
       syncEmail: string | null;
       settings: boolean;
+      importing: boolean;
+      autoLockMs: number;
+      clipboardClearMs: number;
+      entryCount: number;
+      appVersion: string;
     };
 
 export interface Actions {
@@ -48,6 +56,12 @@ export interface Actions {
   openSettings(): void;
   closeSettings(): void;
   saveSyncEmail(email: string): void;
+  openImport(): void;
+  closeImport(): void;
+  importEntries(text: string): void;
+  setAutoLock(ms: number): void;
+  setClipboardClear(ms: number): void;
+  exportMarkdown(): void;
 }
 
 const esc = (s: string) =>
@@ -59,7 +73,8 @@ export function render(root: HTMLElement, s: Screen, a: Actions): void {
   if (s.kind === "locked") return renderLock(root, s, a);
   renderList(root, s, a);
   if (s.editing) renderModal(root, s.editing, a);
-  if (s.settings) renderSettings(root, s.syncEmail, a);
+  if (s.settings) renderSettings(root, s, a);
+  if (s.importing) renderImport(root, a);
 }
 
 // --- password strength (used by edit modal) ---------------------------------
@@ -127,13 +142,21 @@ function renderList(
   const rows = s.entries
     .map((e, i) => {
       const revealed = s.revealedId === e.id;
+      const kws = e.keywords.length
+        ? `<div class="row-kws">${e.keywords
+            .map((k) => `<button class="kwchip" data-kw="${esc(k)}" title="filter by ${esc(k)}">${esc(k)}</button>`)
+            .join("")}</div>`
+        : "";
       return `
       <div class="row ${i === s.selected ? "selected" : ""}" data-i="${i}">
-        <span class="title">${esc(e.title)}</span>
-        <span class="user">${esc(e.username)}</span>
-        <span class="pw">${revealed ? esc(e.password) : "••••••"}</span>
-        <button class="reveal" data-i="${i}" title="hold to reveal">👁</button>
-        <button class="copy" data-i="${i}" title="copy password">📋</button>
+        <div class="row-top">
+          <span class="title">${esc(e.title)}</span>
+          <span class="user">${esc(e.username)}</span>
+          <span class="pw">${revealed ? esc(e.password) : "••••••"}</span>
+          <button class="reveal" data-i="${i}" title="hold to reveal">👁</button>
+          <button class="copy" data-i="${i}" title="copy password">📋</button>
+        </div>
+        ${kws}
       </div>`;
     })
     .join("");
@@ -142,6 +165,7 @@ function renderList(
     <div class="topbar">
       <input id="search" type="search" placeholder="🔍 search…" autocomplete="off" value="${esc(s.query)}" />
       <button id="new">+ New</button>
+      <button id="import" title="import passwords (⌘I)">⬇</button>
       ${s.syncAvailable ? '<button id="sync" title="sync now">⇅</button>' : ""}
       <button id="settings" title="settings">⚙</button>
       <button id="lock" title="lock (⌘L)">🔒</button>
@@ -158,6 +182,7 @@ function renderList(
   search.oninput = () => a.setQuery(search.value);
 
   root.querySelector<HTMLButtonElement>("#new")!.onclick = () => a.openEdit("new");
+  root.querySelector<HTMLButtonElement>("#import")!.onclick = () => a.openImport();
   root.querySelector<HTMLButtonElement>("#lock")!.onclick = () => a.lock();
   const syncBtn = root.querySelector<HTMLButtonElement>("#sync");
   if (syncBtn) syncBtn.onclick = () => a.runSync();
@@ -181,6 +206,12 @@ function renderList(
     r.onclick = () => a.select(Number(r.dataset.i));
     r.ondblclick = () => a.openEdit(s.entries[Number(r.dataset.i)]!);
   });
+  root.querySelectorAll<HTMLButtonElement>(".kwchip").forEach((b) => {
+    b.onclick = (ev) => {
+      ev.stopPropagation();
+      a.setQuery(b.dataset.kw ?? "");
+    };
+  });
 }
 
 // --- 3. add/edit modal -----------------------------------------------------------
@@ -188,7 +219,7 @@ function renderList(
 function renderModal(root: HTMLElement, editing: Entry | "new", a: Actions): void {
   const e: Entry =
     editing === "new"
-      ? { id: "", title: "", username: "", password: "", keywords: [] }
+      ? { id: "", title: "", username: "", password: "", keywords: [], updatedAt: 0 }
       : editing;
   const keywords = [...e.keywords];
 
@@ -213,6 +244,7 @@ function renderModal(root: HTMLElement, editing: Entry | "new", a: Actions): voi
           <input id="m-kw" placeholder="add… (⏎ or ,)" autocomplete="off" />
         </span>
       </label>
+      <div class="suggest" id="m-suggest"></div>
       <label>Notes <textarea id="m-notes" rows="2">${esc(e.notes ?? "")}</textarea></label>
       <div class="actions">
         <span>${editing !== "new" ? '<button type="button" id="m-del" class="danger">Delete</button>' : ""}</span>
@@ -243,6 +275,9 @@ function renderModal(root: HTMLElement, editing: Entry | "new", a: Actions): voi
   updateMeter();
   pass.oninput = updateMeter;
 
+  const suggestBox = $<HTMLDivElement>("#m-suggest");
+  const notesEl = $<HTMLTextAreaElement>("#m-notes");
+
   const renderChips = () => {
     chips.querySelectorAll(".chip").forEach((c) => c.remove());
     for (const [i, kw] of keywords.entries()) {
@@ -255,8 +290,36 @@ function renderModal(root: HTMLElement, editing: Entry | "new", a: Actions): voi
       };
       chips.insertBefore(chip, kwInput);
     }
+    renderSuggestions();
   };
+
+  // Local, one-tap keyword suggestions (never auto-applied).
+  const renderSuggestions = () => {
+    const sugg = suggestKeywords(
+      { title: title.value, username: user.value, notes: notesEl.value },
+      keywords,
+    );
+    if (!sugg.length) {
+      suggestBox.innerHTML = "";
+      return;
+    }
+    suggestBox.innerHTML =
+      `<span class="suggest-label">Suggested:</span>` +
+      sugg
+        .map((k) => `<button type="button" class="suggest-chip" data-kw="${esc(k)}">+ ${esc(k)}</button>`)
+        .join("");
+    suggestBox.querySelectorAll<HTMLButtonElement>(".suggest-chip").forEach((b) => {
+      b.onclick = () => {
+        const kw = b.dataset.kw ?? "";
+        if (kw && !keywords.includes(kw)) keywords.push(kw);
+        renderChips();
+      };
+    });
+  };
+
   renderChips();
+  title.oninput = renderSuggestions;
+  user.oninput = renderSuggestions;
 
   const commitKeyword = () => {
     const v = kwInput.value.trim().replace(/,$/, "").trim();
@@ -296,6 +359,7 @@ function renderModal(root: HTMLElement, editing: Entry | "new", a: Actions): voi
       password: pass.value,
       keywords,
       notes: $<HTMLTextAreaElement>("#m-notes").value.trim() || undefined,
+      updatedAt: Date.now(), // main re-stamps on save; required by the type
     });
   };
   $("#m-save").onclick = save;
@@ -330,54 +394,196 @@ function renderModal(root: HTMLElement, editing: Entry | "new", a: Actions): voi
 
 // --- 4. settings modal -------------------------------------------------------------
 
-function renderSettings(root: HTMLElement, syncEmail: string | null, a: Actions): void {
+function fmtLock(ms: number): string {
+  const m = ms / 60_000;
+  return m >= 1 ? `${m} min` : `${ms / 1000} s`;
+}
+function fmtSec(ms: number): string {
+  return `${ms / 1000} s`;
+}
+
+function renderSettings(
+  root: HTMLElement,
+  s: Extract<Screen, { kind: "list" }>,
+  a: Actions,
+): void {
   const overlay = document.createElement("div");
   overlay.className = "overlay";
+  const lockOpts = AUTO_LOCK_OPTIONS.map(
+    (ms) => `<option value="${ms}" ${ms === s.autoLockMs ? "selected" : ""}>${fmtLock(ms)}</option>`,
+  ).join("");
+  const clipOpts = CLIPBOARD_OPTIONS.map(
+    (ms) => `<option value="${ms}" ${ms === s.clipboardClearMs ? "selected" : ""}>${fmtSec(ms)}</option>`,
+  ).join("");
   overlay.innerHTML = `
     <div class="modal">
       <h2 style="margin:0;font-size:1.1rem">⚙ Settings</h2>
-      <label>Sync email
-        <input id="set-email" type="email" value="${esc(syncEmail ?? "")}" autocomplete="off" placeholder="you@example.com" />
+
+      <div class="set-section">Security</div>
+      <label>Auto-lock after
+        <select id="set-lock">${lockOpts}</select>
       </label>
-      <p style="margin:0;font-size:0.8rem;color:var(--muted)">
-        Identifier for your sync account. Changing it switches to a (possibly new)
-        account — your local vault is then pushed there on the next sync.
-        The account password is derived from your master password automatically.
+      <label>Clear clipboard after
+        <select id="set-clip">${clipOpts}</select>
+      </label>
+
+      <div class="set-section">Sync</div>
+      <label>Sync email
+        <input id="set-email" type="email" value="${esc(s.syncEmail ?? "")}" autocomplete="off" placeholder="you@example.com" />
+      </label>
+      <p class="set-hint">
+        Identifier for your sync account. Changing it switches accounts — your local
+        vault is pushed there on the next sync. The account password is derived from
+        your master password automatically.
       </p>
+
+      <div class="set-section">Vault</div>
+      <div class="set-stats">
+        <span>${s.entryCount} ${s.entryCount === 1 ? "entry" : "entries"}</span>
+        <span>Sync: ${s.syncAvailable ? "on" : "off"}</span>
+        <span>v${esc(s.appVersion)}</span>
+      </div>
+      <button type="button" id="set-export">⬇ Export all to Markdown…</button>
+
       <div class="actions">
         <span></span>
         <span class="right">
-          <button type="button" id="set-cancel">Cancel</button>
-          <button type="button" id="set-save" class="primary">Save</button>
+          <button type="button" id="set-cancel">Close</button>
+          <button type="button" id="set-save" class="primary">Save email</button>
         </span>
       </div>
     </div>`;
   root.appendChild(overlay);
 
-  const email = overlay.querySelector<HTMLInputElement>("#set-email")!;
+  const $ = <T extends HTMLElement>(sel: string) => overlay.querySelector<T>(sel)!;
+  const email = $<HTMLInputElement>("#set-email");
   email.focus();
 
-  const save = () => {
-    const v = email.value.trim();
+  $<HTMLSelectElement>("#set-lock").onchange = (ev) =>
+    a.setAutoLock(Number((ev.target as HTMLSelectElement).value));
+  $<HTMLSelectElement>("#set-clip").onchange = (ev) =>
+    a.setClipboardClear(Number((ev.target as HTMLSelectElement).value));
+
+  // two-step confirm — export writes plaintext to disk
+  const exportBtn = $<HTMLButtonElement>("#set-export");
+  let armed = false;
+  exportBtn.onclick = () => {
+    if (!armed) {
+      armed = true;
+      exportBtn.textContent = "⚠ Writes plaintext — click to confirm";
+      exportBtn.classList.add("danger");
+      return;
+    }
+    a.exportMarkdown();
+  };
+
+  const saveEmail = () => {
+    const v = email.value.trim().toLowerCase();
     if (!v || !v.includes("@")) {
       email.focus();
       return;
     }
+    if (v === (s.syncEmail ?? "")) {
+      a.closeSettings();
+      return;
+    }
     a.saveSyncEmail(v);
   };
-  overlay.querySelector<HTMLButtonElement>("#set-save")!.onclick = save;
-  overlay.querySelector<HTMLButtonElement>("#set-cancel")!.onclick = () => a.closeSettings();
+  $<HTMLButtonElement>("#set-save").onclick = saveEmail;
+  $<HTMLButtonElement>("#set-cancel").onclick = () => a.closeSettings();
   overlay.onkeydown = (ev) => {
     if (ev.key === "Escape") {
       ev.stopPropagation();
       a.closeSettings();
-    } else if (ev.key === "Enter") {
-      ev.preventDefault();
-      save();
     }
   };
   overlay.onclick = (ev) => {
     if (ev.target === overlay) a.closeSettings();
+  };
+}
+
+// --- 5. import modal ---------------------------------------------------------------
+
+function renderImport(root: HTMLElement, a: Actions): void {
+  const overlay = document.createElement("div");
+  overlay.className = "overlay";
+  overlay.innerHTML = `
+    <div class="modal wide">
+      <h2 style="margin:0;font-size:1.1rem">⬇ Import passwords</h2>
+      <label>Paste a CSV export or one entry per line
+        <textarea id="imp-text" rows="8" autocomplete="off" spellcheck="false"
+          placeholder="Example Site:&#10;example-password&#10;&#10;Another Account:&#10;another-password&#10;&#10;— or CSV —&#10;title,username,password"></textarea>
+      </label>
+      <div id="imp-preview" class="import-preview"></div>
+      <p style="margin:0;font-size:0.78rem;color:var(--muted)">
+        Reads CSV exports (Chrome, Safari, Bitwarden, 1Password), one-per-line
+        lists, or name / password blocks separated by blank lines. Nothing is
+        saved until you click Import.
+      </p>
+      <div class="actions">
+        <span></span>
+        <span class="right">
+          <button type="button" id="imp-cancel">Cancel</button>
+          <button type="button" id="imp-save" class="primary" disabled>Import</button>
+        </span>
+      </div>
+    </div>`;
+  root.appendChild(overlay);
+
+  const ta = overlay.querySelector<HTMLTextAreaElement>("#imp-text")!;
+  const preview = overlay.querySelector<HTMLDivElement>("#imp-preview")!;
+  const saveBtn = overlay.querySelector<HTMLButtonElement>("#imp-save")!;
+  ta.focus();
+
+  const update = () => {
+    const { entries, format } = parseImport(ta.value);
+    saveBtn.disabled = entries.length === 0;
+    saveBtn.textContent = entries.length ? `Import ${entries.length}` : "Import";
+    if (!ta.value.trim()) {
+      preview.innerHTML = "";
+      return;
+    }
+    if (entries.length === 0) {
+      preview.innerHTML = `<div class="import-note">Couldn't parse any entries — check the format.</div>`;
+      return;
+    }
+    const shown = entries.slice(0, 8);
+    const rows = shown
+      .map(
+        (e) => `<tr>
+          <td>${esc(e.title)}</td>
+          <td class="muted">${esc(e.username) || "—"}</td>
+          <td class="muted mono">${e.password ? "••••••" : "—"}</td>
+        </tr>`,
+      )
+      .join("");
+    const more =
+      entries.length > shown.length
+        ? `<div class="import-note">+ ${entries.length - shown.length} more</div>`
+        : "";
+    preview.innerHTML = `
+      <div class="import-count">${entries.length} ${entries.length === 1 ? "entry" : "entries"} detected · ${format.toUpperCase()}</div>
+      <table class="import-table">
+        <thead><tr><th>Title</th><th>Username</th><th>Password</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>${more}`;
+  };
+  ta.oninput = update;
+  update();
+
+  saveBtn.onclick = () => a.importEntries(ta.value);
+  overlay.querySelector<HTMLButtonElement>("#imp-cancel")!.onclick = () => a.closeImport();
+  overlay.onkeydown = (ev) => {
+    if (ev.key === "Escape") {
+      ev.stopPropagation();
+      a.closeImport();
+    } else if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey) && !saveBtn.disabled) {
+      ev.preventDefault();
+      a.importEntries(ta.value);
+    }
+  };
+  overlay.onclick = (ev) => {
+    if (ev.target === overlay) a.closeImport();
   };
 }
 

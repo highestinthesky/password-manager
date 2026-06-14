@@ -14,3 +14,17 @@ create policy "own vault" on public.vaults
   for all
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
+
+-- Enable Realtime so other devices are pushed changes instantly (RLS still
+-- scopes events to each user). Idempotent — safe to re-run.
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication_tables
+    where pubname = 'supabase_realtime'
+      and schemaname = 'public'
+      and tablename = 'vaults'
+  ) then
+    alter publication supabase_realtime add table public.vaults;
+  end if;
+end $$;

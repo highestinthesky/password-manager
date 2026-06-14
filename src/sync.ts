@@ -1,15 +1,18 @@
 /**
- * sync.ts — Layer 4: Supabase encrypted-blob sync, last-write-wins.
+ * sync.ts — Layer 4: Supabase encrypted-blob sync via the official client.
  *
- * Single credential design (Bitwarden-style): the Supabase account password is
- * DERIVED from the master password via PBKDF2 with a different salt domain.
- * The server only ever sees that derived value (then bcrypts it) — it can never
- * recover the master password or the vault key. The email is just an identifier.
+ * Zero-knowledge: the Supabase account password is DERIVED from the master
+ * password (PBKDF2, salt domain-separated from the vault key), so the server
+ * only ever sees an opaque ciphertext blob and a derived password it can't
+ * reverse. Reconciliation is entry-level merge, done in main.ts (which holds
+ * the key) — this module only moves encrypted VaultFile blobs in and out and
+ * relays realtime change notifications.
  *
- * Sync is a bolt-on: if env vars are missing or the DB is paused, the app
- * works fine from local storage. Setup: supabase/setup.sql + .env.example
+ * Sync is a bolt-on: with no env vars (or a paused DB) the app is local-only.
+ * Setup: supabase/setup.sql + .env.example.
  */
 
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { VaultFile } from "./vault";
 
 const URL: string | undefined = import.meta.env.VITE_SUPABASE_URL;
@@ -17,7 +20,17 @@ const ANON: string | undefined = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
 const EMAIL_KEY = "pm.sync.email";
 
-/** Account identifier. Locally-set value overrides the build-time default. */
+let client: SupabaseClient | null = null;
+function sb(): SupabaseClient {
+  if (!client) {
+    client = createClient(URL!, ANON!, {
+      auth: { persistSession: true, autoRefreshToken: true, storageKey: "pm.sb.auth" },
+    });
+  }
+  return client;
+}
+
+/** Account identifier. A locally-set value overrides the build-time default. */
 export function getSyncEmail(): string | null {
   return (
     localStorage.getItem(EMAIL_KEY) ??
@@ -40,18 +53,14 @@ export function syncEnabled(): boolean {
 // --- auth password derivation -------------------------------------------------
 
 /**
- * Master password → Supabase account password. Deterministic (same on every
- * device), domain-separated from the vault key (fixed email-based salt vs. the
- * vault's random salt), and one-way (600k PBKDF2).
+ * Master password → Supabase account password. Deterministic across devices,
+ * domain-separated from the vault key (fixed email-based salt vs. the vault's
+ * random salt), and one-way (600k PBKDF2).
  */
 async function deriveAuthPassword(masterPassword: string): Promise<string> {
   const enc = new TextEncoder();
   const material = await crypto.subtle.importKey(
-    "raw",
-    enc.encode(masterPassword),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
+    "raw", enc.encode(masterPassword), "PBKDF2", false, ["deriveBits"],
   );
   const bits = await crypto.subtle.deriveBits(
     {
@@ -68,150 +77,80 @@ async function deriveAuthPassword(masterPassword: string): Promise<string> {
   return btoa(bin);
 }
 
-// --- session (stored locally) ----------------------------------------------------
-
-interface Session {
-  access_token: string;
-  refresh_token: string;
-  expires_at: number; // unix seconds
-  user_id: string;
-}
-
-const SESSION_KEY = "pm.sync.session";
-
-function getSession(): Session | null {
-  const raw = localStorage.getItem(SESSION_KEY);
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as Session;
-  } catch {
-    return null;
-  }
-}
-
-export function signedIn(): boolean {
-  return syncEnabled() && getSession() !== null;
-}
-
-export function signOut(): void {
-  localStorage.removeItem(SESSION_KEY);
-}
-
-interface AuthResponse {
-  access_token: string;
-  refresh_token: string;
-  expires_in: number;
-  user: { id: string };
-}
-
-async function authPost(path: string, body: unknown): Promise<AuthResponse> {
-  const res = await fetch(`${URL}${path}`, {
-    method: "POST",
-    headers: { apikey: ANON!, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data: unknown = await res.json();
-  if (!res.ok) {
-    const d = data as { error_description?: string; msg?: string };
-    throw new Error(d.error_description ?? d.msg ?? `auth failed (${res.status})`);
-  }
-  return data as AuthResponse;
-}
-
-function storeSession(d: AuthResponse): void {
-  const s: Session = {
-    access_token: d.access_token,
-    refresh_token: d.refresh_token,
-    expires_at: Math.floor(Date.now() / 1000) + d.expires_in,
-    user_id: d.user.id,
-  };
-  localStorage.setItem(SESSION_KEY, JSON.stringify(s));
-}
+// --- auth ---------------------------------------------------------------------
 
 /**
- * Sign in using credentials derived from the master password.
- * First ever run auto-creates the account (requires "Confirm email" OFF in
- * Supabase → Authentication, since nobody knows the derived password to type).
+ * Sign in with credentials derived from the master password. First run on an
+ * account auto-creates it (requires "Confirm email" OFF in Supabase Auth, since
+ * nobody ever types the derived password). The official client persists and
+ * auto-refreshes the session, so this is a no-op once signed in.
  */
 export async function ensureSignedIn(masterPassword: string): Promise<void> {
   if (!syncEnabled()) throw new Error("sync not configured");
-  if (getSession()) return;
+  const c = sb();
+  const { data: { session } } = await c.auth.getSession();
+  if (session) return;
+
   const email = getSyncEmail()!;
-  const authPw = await deriveAuthPassword(masterPassword);
-  try {
-    storeSession(
-      await authPost("/auth/v1/token?grant_type=password", {
-        email,
-        password: authPw,
-      }),
+  const password = await deriveAuthPassword(masterPassword);
+
+  const signIn = await c.auth.signInWithPassword({ email, password });
+  if (signIn.data.session) return;
+
+  // No account yet (or wrong password) — try to create it.
+  const signUp = await c.auth.signUp({ email, password });
+  if (signUp.error) throw signUp.error;
+  if (!signUp.data.session)
+    throw new Error(
+      "account needs email confirmation — disable 'Confirm email' in Supabase Auth settings",
     );
-  } catch {
-    // no account yet (or wrong password) — try creating it
-    const d = await authPost("/auth/v1/signup", { email, password: authPw });
-    if (!d.access_token)
-      throw new Error(
-        "account needs email confirmation — disable 'Confirm email' in Supabase Auth settings",
-      );
-    storeSession(d);
-  }
 }
 
-async function freshToken(): Promise<Session> {
-  let s = getSession();
-  if (!s) throw new Error("Not signed in");
-  if (s.expires_at - 60 < Date.now() / 1000) {
-    storeSession(
-      await authPost("/auth/v1/token?grant_type=refresh_token", {
-        refresh_token: s.refresh_token,
-      }),
-    );
-    s = getSession()!;
-  }
-  return s;
+export function signOut(): void {
+  if (!URL || !ANON) return;
+  void sb().auth.signOut();
 }
 
-// --- blob push/pull -----------------------------------------------------------------
-
-async function rest(path: string, init: RequestInit = {}): Promise<Response> {
-  const s = await freshToken();
-  return fetch(`${URL}/rest/v1${path}`, {
-    ...init,
-    headers: {
-      apikey: ANON!,
-      Authorization: `Bearer ${s.access_token}`,
-      "Content-Type": "application/json",
-      ...(init.headers ?? {}),
-    },
-  });
-}
+// --- blob push / pull ---------------------------------------------------------
 
 export async function pullVault(): Promise<VaultFile | null> {
-  const res = await rest("/vaults?select=blob&limit=1");
-  if (!res.ok) throw new Error(`pull failed (${res.status})`);
-  const rows = (await res.json()) as Array<{ blob: VaultFile }>;
-  return rows[0]?.blob ?? null;
+  const { data, error } = await sb()
+    .from("vaults")
+    .select("blob")
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error(error.message);
+  return (data?.blob as VaultFile | undefined) ?? null;
 }
 
 export async function pushVault(v: VaultFile): Promise<void> {
-  const s = await freshToken();
-  const res = await rest("/vaults", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates" },
-    body: JSON.stringify([{ user_id: s.user_id, blob: v, updated_at: v.updatedAt }]),
-  });
-  if (!res.ok) throw new Error(`push failed (${res.status})`);
+  const c = sb();
+  const { data: { user } } = await c.auth.getUser();
+  if (!user) throw new Error("not signed in");
+  const { error } = await c
+    .from("vaults")
+    .upsert({ user_id: user.id, blob: v, updated_at: v.updatedAt });
+  if (error) throw new Error(error.message);
 }
 
-/** Last-write-wins reconciliation between the local and remote vault files. */
-export async function syncVault(
-  local: VaultFile | null,
-): Promise<{ vault: VaultFile | null; action: "pulled" | "pushed" | "in-sync" }> {
-  const remote = await pullVault();
-  if (remote && (!local || remote.updatedAt > local.updatedAt))
-    return { vault: remote, action: "pulled" };
-  if (local && (!remote || local.updatedAt > remote.updatedAt)) {
-    await pushVault(local);
-    return { vault: local, action: "pushed" };
-  }
-  return { vault: local, action: "in-sync" };
+// --- realtime -----------------------------------------------------------------
+
+/**
+ * Subscribe to changes on this user's vault row. RLS scopes events to the
+ * signed-in user, so we're pinged whenever another device pushes. Returns an
+ * unsubscribe function. Call after ensureSignedIn so the socket is authorized.
+ */
+export function subscribeVault(onChange: () => void): () => void {
+  const c = sb();
+  const channel = c
+    .channel("vault-sync")
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "vaults" },
+      () => onChange(),
+    )
+    .subscribe();
+  return () => {
+    void c.removeChannel(channel);
+  };
 }

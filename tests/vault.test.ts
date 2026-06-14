@@ -21,6 +21,7 @@ const entries: Entry[] = [
     username: "haolun.z",
     password: "correct horse battery staple",
     keywords: ["code", "git"],
+    updatedAt: 1_700_000_000_000,
   },
   {
     id: newEntryId(),
@@ -29,6 +30,7 @@ const entries: Entry[] = [
     password: "p@ssw0rd!",
     keywords: ["school"],
     notes: "security question: first pet = 'Mochi'",
+    updatedAt: 1_700_000_000_001,
   },
 ];
 
@@ -52,7 +54,7 @@ describe("vault round-trip", () => {
     const salt = newSalt();
     const key = await deriveKey("密码🔐", salt, TEST_ITERS);
     const e: Entry[] = [
-      { id: newEntryId(), title: "微信", username: "宁", password: "🦄🌈", keywords: ["聊天"] },
+      { id: newEntryId(), title: "微信", username: "宁", password: "🦄🌈", keywords: ["聊天"], updatedAt: 1_700_000_000_000 },
     ];
     const vault = await encryptVault(e, key, salt, TEST_ITERS);
     expect(await decryptVault(vault, key)).toEqual(e);
@@ -111,7 +113,7 @@ describe("vault file format", () => {
     const key = await deriveKey("master-pw", salt, TEST_ITERS);
     const before = Date.now();
     const vault = await encryptVault(entries, key, salt, TEST_ITERS);
-    expect(vault.version).toBe(1);
+    expect(vault.version).toBe(2);
     expect(vault.kdf.algo).toBe("PBKDF2-SHA256");
     expect(vault.kdf.iterations).toBe(TEST_ITERS);
     expect(vault.cipher.algo).toBe("AES-256-GCM");
