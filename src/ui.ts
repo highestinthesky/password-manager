@@ -15,7 +15,9 @@ export type Screen =
       mode: "unlock" | "create";
       busy: boolean;
       error: string | null;
+      syncConfigured: boolean;
       syncAvailable: boolean;
+      syncEmail: string | null;
       toast: string | null;
     }
   | {
@@ -116,6 +118,12 @@ function renderLock(
       <div class="status ${s.error ? "error" : ""}">
         ${s.busy ? "deriving key… ▓▓▓░░" : s.error ? esc(s.error) : create ? "First run — choose a master password" : ""}
       </div>
+      ${create && s.syncConfigured ? `
+        <div class="lock-sync">
+          <input id="sync-email" type="email" value="${esc(s.syncEmail ?? "")}"
+                 placeholder="sync email" autocomplete="email" ${s.busy ? "disabled" : ""} />
+          <button type="button" id="save-sync-email" ${s.busy ? "disabled" : ""}>Save sync email</button>
+        </div>` : ""}
       ${create && s.syncAvailable ? `<button type="button" id="restore" ${s.busy ? "disabled" : ""} title="type your master password above, then click">⇅ Restore from sync</button>` : ""}
       ${s.toast ? `<div class="toast">${esc(s.toast)}</div>` : ""}
     </div>`;
@@ -124,6 +132,25 @@ function renderLock(
   pw.focus();
   const restoreBtn = root.querySelector<HTMLButtonElement>("#restore");
   if (restoreBtn) restoreBtn.onclick = () => a.restore(pw.value);
+  const syncEmail = root.querySelector<HTMLInputElement>("#sync-email");
+  const saveSyncEmail = root.querySelector<HTMLButtonElement>("#save-sync-email");
+  if (syncEmail && saveSyncEmail) {
+    const save = () => {
+      const email = syncEmail.value.trim().toLowerCase();
+      if (!email || !email.includes("@")) {
+        syncEmail.focus();
+        return;
+      }
+      a.saveSyncEmail(email);
+    };
+    saveSyncEmail.onclick = save;
+    syncEmail.onkeydown = (ev) => {
+      if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) {
+        ev.preventDefault();
+        save();
+      }
+    };
+  }
   form.onsubmit = (ev) => {
     ev.preventDefault();
     const pw2 = root.querySelector<HTMLInputElement>("#pw2");
@@ -586,4 +613,3 @@ function renderImport(root: HTMLElement, a: Actions): void {
     if (ev.target === overlay) a.closeImport();
   };
 }
-

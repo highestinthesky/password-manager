@@ -24,6 +24,7 @@ import { toMarkdown, exportFilename } from "./markdown";
 import { loadPrefs, savePrefs, type Prefs } from "./prefs";
 import * as sync from "./sync";
 import { render, type Screen, type Actions } from "./ui";
+import { setVaultIcon } from "./appIcon";
 
 const APP_VERSION = "0.3.0";
 const HIDDEN_GRACE_MS = 30_000; // lock 30s after tab hidden
@@ -80,7 +81,9 @@ function screen(): Screen {
       mode: cachedVault ? "unlock" : "create",
       busy: lockBusy,
       error: lockError,
+      syncConfigured: sync.syncConfigured(),
       syncAvailable: sync.syncEnabled(),
+      syncEmail: sync.getSyncEmail(),
       toast,
     };
   const list = filtered();
@@ -105,6 +108,7 @@ function screen(): Screen {
 }
 
 function paint(): void {
+  setVaultIcon(Boolean(key));
   render(root, screen(), actions);
 }
 

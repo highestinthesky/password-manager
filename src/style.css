@@ -59,6 +59,9 @@ input:focus, textarea:focus, button:focus-visible { outline: 2px solid var(--acc
 }
 .lock h1 { font-size: 1.4rem; margin: 0; }
 .lock form { display: flex; flex-direction: column; gap: 10px; width: 280px; }
+.lock-sync { display: flex; gap: 8px; width: min(100%, 360px); }
+.lock-sync input { flex: 1; min-width: 0; }
+.lock-sync button { white-space: nowrap; }
 .lock .status { color: var(--muted); font-size: 0.9rem; min-height: 1.2em; }
 .lock .error { color: var(--danger); }
 .shake { animation: shake 0.35s; }
