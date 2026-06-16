@@ -1,56 +1,140 @@
 # Password Manager
 
-Local-first, zero-knowledge password manager. See `Password_Manager__Build_Blueprint.pdf` for the full design.
+A private password vault for storing logins, notes, and generated passwords on
+your own device. The app opens as **My Vault**, stays locked behind one master
+password, and only decrypts your entries while you are actively using it.
 
-## Status
+This project is local-first. You can use it without an account, and optional
+sync stores only an encrypted vault blob.
 
-- ✅ Layer 1 — vault core (`src/vault.ts`): PBKDF2-SHA256 600k + AES-256-GCM, unit-tested
-- ✅ Layer 2 — web UI: lock screen, list, edit modal; deploy workflow ready
-- ✅ Layer 3 — Tauri Mac app scaffold (`src-tauri/`), vault file on disk
-- ✅ Layer 4 — Supabase blob sync (last-write-wins), generator, strength meter, clipboard clear, keep-alive cron
+## What You Can Do
 
-## Try it (web)
+- Create a vault protected by a master password.
+- Save account names, usernames, passwords, keywords, and notes.
+- Search by title, username, or keyword.
+- Copy passwords and usernames quickly.
+- Generate strong passwords when adding or editing an entry.
+- Import passwords from common CSV exports or simple pasted lists.
+- Export your vault to a readable Markdown file when you need a backup.
+- Auto-lock the vault and clear copied passwords from the clipboard.
+- Sync an encrypted copy between devices when sync is available.
 
-```sh
-npm install
-npm run dev    # open the printed URL, create a vault
-npm test       # vault crypto tests
-npm run build  # type-check + production build → dist/
-```
+## First Use
 
-## Deploy to GitHub Pages
+1. Open the app.
+2. Choose a master password.
+3. Add your first entry with **New**.
+4. Use search to find an entry, then copy the password or username when needed.
+5. Lock the vault when you are done.
 
-Push to a **public** GitHub repo, then Settings → Pages → source: **GitHub Actions**. `deploy.yml` tests, builds, and publishes on every push to `main`.
+Choose your master password carefully. It cannot be recovered or reset by the
+app. If you forget it, the encrypted vault cannot be opened.
 
-## Mac app (Layer 3)
+## Daily Use
 
-One-time setup on your Mac:
+Use the search field to narrow the list. Double-click an entry to edit it, or
+select it and use the keyboard shortcuts below. Hold the eye button to reveal a
+password temporarily.
 
-```sh
-xcode-select --install                                     # Apple build tools
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust
-npx tauri icon app-icon.png                                # generate icon set
-```
+When you copy a password or username, the app can clear it from your clipboard
+after a short delay. You can change that delay in **Settings**.
 
-Then `npm run tauri dev` to run, or `npm run tauri build` — the `.app` lands in `src-tauri/target/release/bundle/macos/`, drag it to Applications. No Apple Developer fee. The vault lives in `~/Library/Application Support/com.ning.passwordmanager/vault.json`.
+## Adding And Editing Entries
 
-## Sync (Layer 4)
+Each entry can include:
 
-Off by default; the app is fully local without it.
+- Title
+- Username
+- Password
+- Keywords
+- Notes
 
-1. Create a free project at supabase.com
-2. Run `supabase/setup.sql` in the SQL Editor (table + row-level security)
-3. Copy `.env.example` → `.env`, fill in your project URL + anon key, rebuild
-4. In the app: Settings → Sync email. The email is stored only in that browser/device. Syncs on unlock and after every save
-5. For the deployed site: set `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` as repo **variables** (Actions)
-6. Keep-alive: set `SUPABASE_URL` / `SUPABASE_ANON_KEY` as repo **secrets** — `keepalive.yml` pings every 3 days so the free project never pauses
+The password generator creates a new password for the entry you are editing.
+The strength meter gives a quick estimate of password quality. Keyword
+suggestions are created locally from the entry text and are never sent anywhere.
 
-The server only ever stores the encrypted blob. The sync account password is separate from your master password; the master password never leaves the device.
+Deleting an entry removes it from the visible vault. If sync is enabled, that
+delete is also carried to your other devices.
 
-If two devices use different master passwords, pull is refused ("different master password") — make sure both vaults were created with the same one.
+## Importing Passwords
 
-## Shortcuts
+Use **Import** to paste existing passwords into the vault. The app can read:
 
-`↑↓` move · `⏎` copy password · `⌘⏎` copy username · `⌘E` edit · `⌘N` new · `⌘L` lock
+- CSV exports from tools such as Chrome, Safari, Bitwarden, and 1Password
+- One-entry-per-line lists
+- Name and password blocks separated by blank lines
 
-⚠️ Learning build — keep real high-stakes passwords in a battle-tested manager until this has been hardened and reviewed.
+The import screen previews what it found before anything is saved. If an
+imported row has the same title and username as an existing entry, it is skipped
+as a duplicate.
+
+## Exporting A Backup
+
+Use **Settings -> Export all to Markdown** to save a readable backup of your
+vault.
+
+The exported file is plaintext. It contains real usernames, passwords, keywords,
+and notes. Store it somewhere safe, move it to secure backup storage, or delete
+it when you no longer need it.
+
+The Markdown export is intentionally readable and can be imported again later.
+
+## Sync
+
+Sync is optional. The vault works locally even when sync is off or unavailable.
+
+When sync is available, add a sync email in **Settings**. The email identifies
+your sync account. Your master password is still the secret that unlocks the
+vault, and the server stores only the encrypted vault blob.
+
+To restore on another device:
+
+1. Open the app on the new device.
+2. Enter the same sync email.
+3. Type the same master password.
+4. Choose **Restore from sync**.
+
+All synced devices must use the same master password. If another device created
+a vault with a different master password, the app will keep your local copy and
+refuse to pull that remote vault.
+
+## Privacy And Security
+
+- Your vault contents are encrypted with AES-256-GCM.
+- Your master password is stretched with PBKDF2-SHA256 before use.
+- Titles, usernames, passwords, keywords, and notes are all inside the encrypted
+  vault.
+- The master password is not stored.
+- The web version saves the encrypted vault in the browser's local storage.
+- The Mac app saves the encrypted vault in its app data folder.
+
+Because the web version stores its local vault in browser storage, clearing site
+data can remove the local copy. Keep sync enabled or export a backup if you need
+recovery on a new browser or device.
+
+## Settings
+
+Settings lets you change:
+
+- Auto-lock delay
+- Clipboard clear delay
+- Sync email
+- Markdown export
+
+The vault also locks shortly after the app or browser tab is hidden.
+
+## Keyboard Shortcuts
+
+- **Up / Down**: move through entries
+- **Enter**: copy the selected password
+- **Command/Ctrl + Enter**: copy the selected username
+- **Command/Ctrl + E**: edit the selected entry
+- **Command/Ctrl + N**: add a new entry
+- **Command/Ctrl + I**: import passwords
+- **Command/Ctrl + L**: lock the vault
+
+## Important Note
+
+This is a learning build and has not had the same hardening, audit, or recovery
+work as a mature commercial password manager. Do not keep your only copy of
+high-stakes credentials here until you are comfortable with that risk.
