@@ -31,7 +31,6 @@ jobs:
           # The anon key is public by design; RLS guards the data.
           VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY }}
-          VITE_SYNC_EMAIL: ${{ vars.VITE_SYNC_EMAIL }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

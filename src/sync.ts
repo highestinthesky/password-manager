@@ -30,13 +30,10 @@ function sb(): SupabaseClient {
   return client;
 }
 
-/** Account identifier. A locally-set value overrides the build-time default. */
+/** Account identifier. Stored per browser/device so it is never baked into builds. */
 export function getSyncEmail(): string | null {
-  return (
-    localStorage.getItem(EMAIL_KEY) ??
-    (import.meta.env.VITE_SYNC_EMAIL as string | undefined) ??
-    null
-  );
+  const email = localStorage.getItem(EMAIL_KEY)?.trim().toLowerCase();
+  return email || null;
 }
 
 /** Changing the email switches accounts, so the old session is dropped. */
@@ -45,9 +42,14 @@ export function setSyncEmail(email: string): void {
   signOut();
 }
 
-/** True when configured with a Supabase project + sync email. */
+/** True when the shipped app has a Supabase project configured. */
+export function syncConfigured(): boolean {
+  return Boolean(URL && ANON);
+}
+
+/** True when configured with a Supabase project + locally saved sync email. */
 export function syncEnabled(): boolean {
-  return Boolean(URL && ANON && getSyncEmail());
+  return Boolean(syncConfigured() && getSyncEmail());
 }
 
 // --- auth password derivation -------------------------------------------------

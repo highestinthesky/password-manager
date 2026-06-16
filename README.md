@@ -41,7 +41,7 @@ Off by default; the app is fully local without it.
 1. Create a free project at supabase.com
 2. Run `supabase/setup.sql` in the SQL Editor (table + row-level security)
 3. Copy `.env.example` → `.env`, fill in your project URL + anon key, rebuild
-4. In the app: ⇅ button → create account / sign in. Syncs on unlock and after every save
+4. In the app: Settings → Sync email. The email is stored only in that browser/device. Syncs on unlock and after every save
 5. For the deployed site: set `VITE_SUPABASE_URL` / `VITE_SUPABASE_ANON_KEY` as repo **variables** (Actions)
 6. Keep-alive: set `SUPABASE_URL` / `SUPABASE_ANON_KEY` as repo **secrets** — `keepalive.yml` pings every 3 days so the free project never pauses
 
